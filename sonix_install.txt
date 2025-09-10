@@ -1,0 +1,1125 @@
+#!/usr/bin/env bash
+# =====================================================================
+# SONIX - Production NFC Jukebox Installer (Raspberry Pi Zero 2W)
+# - NFC write/read + autoplay (PN532 I2C)
+# - Flask backend + modern web remote
+# - VLC + yt-dlp fast playback (low latency)
+# - Progress/seek via VLC RC socket
+# - Bluetooth (PulseAudio system mode) + volume control
+# - mDNS (sonix.local)
+# Run as: sudo bash install.sh
+# =====================================================================
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# -----------------------------
+# Configuration
+# -----------------------------
+SONIX_USER="${SONIX_USER:-sonix}"
+APP_ROOT="${APP_ROOT:-/opt/sonix}"
+VENV_DIR="${VENV_DIR:-${APP_ROOT}/venv}"
+BACKEND_DIR="${BACKEND_DIR:-${APP_ROOT}/backend}"
+FRONTEND_DIR="${FRONTEND_DIR:-${APP_ROOT}/frontend}"
+TOOLS_DIR="${TOOLS_DIR:-${APP_ROOT}/tools}"
+LOG_DIR="${LOG_DIR:-/var/log/sonix}"
+PORT="${PORT:-5000}"
+PYTHON_BIN="/usr/bin/python3"
+
+APT_PACKAGES=(
+    python3-venv python3-dev build-essential git curl wget ca-certificates
+    i2c-tools vim nano vlc alsa-utils
+    bluez bluetooth bluez-tools
+    pulseaudio pulseaudio-utils pulseaudio-module-bluetooth
+    avahi-daemon libnss-mdns dbus dbus-user-session
+    libasound2-dev pkg-config socat
+)
+
+echo "🎸 === SONIX PRODUCTION INSTALLER === 🎸"
+echo "Target: Raspberry Pi Zero 2W"
+echo ""
+
+if [[ "$(id -u)" -ne 0 ]]; then
+    echo "❌ This script must be run as root. Use sudo."
+    exit 1
+fi
+
+# -----------------------------
+# [1/13] System preparation
+# -----------------------------
+echo "📦 [1/13] System preparation and user setup..."
+if ! id -u "${SONIX_USER}" >/dev/null 2>&1; then
+    useradd -m -s /bin/bash "${SONIX_USER}" || true
+    echo "✅ User ${SONIX_USER} created"
+fi
+
+# Add user to hardware groups
+for g in audio bluetooth i2c gpio dialout video netdev; do
+    if getent group "$g" >/dev/null 2>&1; then
+        usermod -aG "$g" "${SONIX_USER}" || true
+    fi
+done
+
+# -----------------------------
+# [2/13] Enable I2C
+# -----------------------------
+echo "🔌 [2/13] Enabling I2C interface..."
+if command -v raspi-config >/dev/null 2>&1; then
+    raspi-config nonint do_i2c 0 || true
+fi
+if [[ -f /boot/firmware/config.txt ]]; then
+    grep -q '^dtparam=i2c_arm=on' /boot/firmware/config.txt || echo "dtparam=i2c_arm=on" >> /boot/firmware/config.txt
+elif [[ -f /boot/config.txt ]]; then
+    grep -q '^dtparam=i2c_arm=on' /boot/config.txt || echo "dtparam=i2c_arm=on" >> /boot/config.txt
+fi
+modprobe i2c-dev || true
+echo "✅ I2C interface enabled (reboot recommended if first time)"
+
+# -----------------------------
+# [3/13] Packages
+# -----------------------------
+echo "📚 [3/13] Installing system packages..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${APT_PACKAGES[@]}" || true
+systemctl enable --now avahi-daemon bluetooth || true
+
+# -----------------------------
+# [4/13] PulseAudio System Mode
+# -----------------------------
+echo "🔊 [4/13] Configuring PulseAudio system mode..."
+cat > /etc/systemd/system/pulseaudio-system.service << 'EOF'
+[Unit]
+Description=PulseAudio system-wide
+After=bluetooth.service dbus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/pulseaudio --system --daemonize=no --disallow-exit --log-target=journal
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+mkdir -p /etc/pulse
+# Ensure native socket + BT modules
+grep -q 'module-native-protocol-unix' /etc/pulse/system.pa 2>/dev/null || cat >> /etc/pulse/system.pa << 'EOF'
+load-module module-native-protocol-unix auth-anonymous=1
+load-module module-bluetooth-policy
+load-module module-bluetooth-discover
+EOF
+
+systemctl daemon-reload
+systemctl enable --now pulseaudio-system || true
+
+# -----------------------------
+# [5/13] Directories
+# -----------------------------
+echo "📁 [5/13] Creating directories..."
+mkdir -p "${BACKEND_DIR}" "${FRONTEND_DIR}" "${TOOLS_DIR}" "${LOG_DIR}" /etc/sonix /run/sonix
+chown -R "${SONIX_USER}:${SONIX_USER}" "${APP_ROOT}" /etc/sonix "${LOG_DIR}"
+chmod 755 "${APP_ROOT}" "${BACKEND_DIR}" "${FRONTEND_DIR}" "${TOOLS_DIR}"
+
+# -----------------------------
+# [6/13] Python environment
+# -----------------------------
+echo "🐍 [6/13] Setting up Python venv..."
+${PYTHON_BIN} -m venv "${VENV_DIR}"
+chown -R "${SONIX_USER}:${SONIX_USER}" "${VENV_DIR}"
+
+sudo -u "${SONIX_USER}" bash -c "
+    source '${VENV_DIR}/bin/activate'
+    pip install --upgrade pip setuptools wheel
+    pip install --no-cache-dir \
+        flask flask-cors requests psutil yt-dlp \
+        pychromecast python-vlc adafruit-blinka \
+        adafruit-circuitpython-pn532
+"
+echo "✅ Python environment ready"
+
+# -----------------------------
+# [7/13] Audio target tool
+# -----------------------------
+echo "🎚️ [7/13] Creating audio target tool..."
+cat > /etc/sonix/audio_target.conf << 'EOF'
+# Sonix audio target: hdmi, analog, or bt:MAC_ADDRESS
+target=hdmi
+EOF
+
+cat > /usr/local/bin/sonix-apply-audio-target << 'EOF'
+#!/usr/bin/env bash
+set -e
+export PULSE_SERVER=unix:/var/run/pulse/native
+CFG="/etc/sonix/audio_target.conf"
+TARGET=$(grep '^target=' "$CFG" 2>/dev/null | cut -d= -f2- || echo "hdmi")
+
+if command -v pactl >/dev/null 2>&1; then
+    case "$TARGET" in
+        hdmi) SINK=$(pactl list short sinks | awk '/hdmi|vc4/ {print $2; exit}')
+              [[ -n "$SINK" ]] && pactl set-default-sink "$SINK" || true ;;
+        analog) SINK=$(pactl list short sinks | awk '/analog|alsa/ {print $2; exit}')
+                [[ -n "$SINK" ]] && pactl set-default-sink "$SINK" || true ;;
+        bt:*) SINK=$(pactl list short sinks | awk '/bluez/ {print $2; exit}')
+              [[ -n "$SINK" ]] && pactl set-default-sink "$SINK" || true ;;
+    esac
+else
+    case "$TARGET" in
+        hdmi) amixer cset numid=3 2 >/dev/null || true ;;
+        analog) amixer cset numid=3 1 >/dev/null || true ;;
+    esac
+fi
+EOF
+chmod +x /usr/local/bin/sonix-apply-audio-target
+
+# -----------------------------
+# [8/13] Backend (Flask)
+# -----------------------------
+echo "🌐 [8/13] Creating Flask backend..."
+cat > "${BACKEND_DIR}/app.py" << 'EOF'
+#!/usr/bin/env python3
+import os, subprocess, json, time, re
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+FRONTEND = os.path.join(os.path.dirname(APP_ROOT), "frontend")
+app = Flask(__name__, static_folder=FRONTEND, static_url_path="")
+CORS(app)
+
+STATE = {"now": None, "queue": [], "repeat": False, "volume": 1.0}
+YTDLP = os.path.join(os.path.dirname(os.path.dirname(__file__)), "venv", "bin", "yt-dlp")
+SONIX_PLAY = "/usr/local/bin/sonix-play"
+
+def resolve_stream(url):
+    try:
+        cmd = [YTDLP, "-g", "-f", "bestaudio[abr<=160]/bestaudio/best", "--no-playlist", url]
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=25)
+        return out.splitlines()[0].strip()
+    except Exception:
+        return url
+
+def get_title(url):
+    try:
+        cmd = [YTDLP, "--get-title", "--no-playlist", url]
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=10)
+        return out.strip()
+    except Exception:
+        return url
+
+@app.route("/")
+def kiosk():
+    return send_from_directory(FRONTEND, "kiosk.html")
+
+@app.route("/remote")
+def remote():
+    return send_from_directory(FRONTEND, "remote.html")
+
+@app.route("/api/resolve", methods=["POST"])
+def api_resolve():
+    j = request.json or {}
+    url = j.get("url")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    return jsonify({"stream": resolve_stream(url), "title": get_title(url)})
+
+@app.route("/api/queue", methods=["GET", "POST", "DELETE"])
+def api_queue():
+    if request.method == "GET":
+        return jsonify({"queue": STATE["queue"], "now": STATE["now"], "repeat": STATE["repeat"]})
+    elif request.method == "POST":
+        d = request.json or {}
+        url = d.get("url")
+        if not url:
+            return jsonify({"error": "missing url"}), 400
+        STATE["queue"].append({"url": url, "title": d.get("title") or url})
+        return jsonify({"ok": True, "queue": STATE["queue"]})
+    elif request.method == "DELETE":
+        STATE["queue"].clear()
+        return jsonify({"ok": True})
+
+@app.route("/api/control", methods=["POST"])
+def api_control():
+    d = request.json or {}
+    cmd = d.get("cmd")
+
+    if cmd == "play":
+        url = d.get("url")
+        if not url:
+            return jsonify({"error": "missing url"}), 400
+        stream = d.get("stream") or resolve_stream(url)
+        subprocess.Popen([SONIX_PLAY, stream])
+        STATE["now"] = {"url": url, "stream": stream, "title": get_title(url)}
+        return jsonify({"ok": True, "now": STATE["now"], "paused": False})
+
+    elif cmd == "pause_toggle":
+        try:
+            subprocess.check_output(["socat", "-", "UNIX-CONNECT:/run/sonix_vlc.sock"], input="pause\n", text=True, timeout=1)
+            return jsonify({"ok": True})
+        except Exception as e:
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    elif cmd == "stop":
+        subprocess.call([SONIX_PLAY, "--stop"])
+        STATE["now"] = None
+        return jsonify({"ok": True})
+
+    elif cmd == "skip":
+        subprocess.call([SONIX_PLAY, "--stop"])
+        if STATE["queue"]:
+            nxt = STATE["queue"].pop(0)
+            stream = nxt.get("stream") or resolve_stream(nxt["url"])
+            subprocess.Popen([SONIX_PLAY, stream])
+            STATE["now"] = {
+                "url": nxt["url"],
+                "stream": stream,
+                "title": nxt.get("title") or get_title(nxt["url"])
+            }
+        else:
+            STATE["now"] = None
+        return jsonify({"ok": True, "now": STATE["now"]})
+
+    elif cmd == "repeat_toggle":
+        STATE["repeat"] = not STATE["repeat"]
+        return jsonify({"repeat": STATE["repeat"]})
+
+    elif cmd == "volume":
+        v = float(d.get("value", 1.0))
+        if v > 1.0:
+            v = v / 100.0
+        STATE["volume"] = v
+        percent = max(0, min(100, int(v * 100)))
+        ok = False
+        env = dict(os.environ, PULSE_SERVER="unix:/var/run/pulse/native")
+        try:
+            subprocess.check_call(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{percent}%"],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+            ok = True
+        except Exception:
+            pass
+        if not ok:
+            try:
+                subprocess.check_call(["amixer", "set", "Master", f"{percent}%"],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                ok = True
+            except Exception:
+                pass
+        return jsonify({"ok": ok})
+
+    return jsonify({"error": "unknown cmd"}), 400
+
+@app.route("/api/status")
+def api_status():
+    sock = "/run/sonix_vlc.sock"
+    cur = total = 0
+    try:
+        out_t = subprocess.check_output(["socat", "-", "UNIX-CONNECT:"+sock], input="get_time\n", text=True, timeout=1)
+        out_l = subprocess.check_output(["socat", "-", "UNIX-CONNECT:"+sock], input="get_length\n", text=True, timeout=1)
+        cur = int(re.findall(r"(\d+)", out_t or "0")[0])
+        total = int(re.findall(r"(\d+)", out_l or "0")[0])
+    except Exception:
+        pass
+    return jsonify({"now": STATE["now"], "position": cur, "duration": total})
+
+@app.route("/api/seek", methods=["POST"])
+def api_seek():
+    d = request.json or {}
+    seconds = int(d.get("seconds", 0))
+    try:
+        subprocess.check_output(["socat", "-", "UNIX-CONNECT:/run/sonix_vlc.sock"], input=f"seek {seconds}\n", text=True, timeout=1)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+@app.route("/api/bt/scan")
+def api_bt_scan():
+    try:
+        subprocess.run('echo -e "power on\nscan on\n" | timeout 6s bluetoothctl >/tmp/sonix_bt_scan.txt 2>&1', shell=True)
+        subprocess.run('echo -e "devices\nquit" | bluetoothctl >>/tmp/sonix_bt_scan.txt', shell=True)
+        out = open("/tmp/sonix_bt_scan.txt").read()
+    except Exception:
+        out = ""
+    devs = []
+    for ln in out.splitlines():
+        ln = ln.strip()
+        if ln.startswith("Device "):
+            parts = ln.split(" ", 2)
+            if len(parts) >= 3:
+                devs.append({"mac": parts[1], "name": parts[2]})
+    return jsonify({"devices": devs})
+
+@app.route("/api/bt/pair", methods=["POST"])
+def api_bt_pair():
+    d = request.json or {}
+    mac = d.get("mac")
+    if not mac:
+        return jsonify({"error": "missing mac"}), 400
+    cmd = f'echo -e "power on\nagent NoInputNoOutput\ndefault-agent\npair {mac}\ntrust {mac}\nconnect {mac}\nquit" | bluetoothctl'
+    subprocess.run(cmd, shell=True)
+    with open("/etc/sonix/audio_target.conf", "w") as fh:
+        fh.write(f"target=bt:{mac.replace(':', '_')}\n")
+    try:
+        env = dict(os.environ, PULSE_SERVER="unix:/var/run/pulse/native")
+        subprocess.run(["pactl","list","short","sinks"], env=env, check=False)
+        subprocess.run(["/usr/local/bin/sonix-apply-audio-target"], check=False)
+    except Exception:
+        pass
+    return jsonify({"paired": mac})
+
+@app.route("/api/nfc/write", methods=["POST"])
+def api_nfc_write():
+    data = request.json or {}
+    url = data.get("url")
+    if not url:
+        return jsonify({"error": "missing url"}), 400
+    try:
+        subprocess.check_call(["/opt/sonix/tools/nfc_write_helper.sh", url], timeout=30)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/nfc/read", methods=["GET"])
+def api_nfc_read():
+    try:
+        out = subprocess.check_output(["/opt/sonix/tools/nfc_read_helper.sh"], text=True, timeout=10)
+        return jsonify({"ok": True, "out": out})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/<path:path>")
+def static_proxy(path):
+    return send_from_directory(FRONTEND, path)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000)
+EOF
+chmod +x "${BACKEND_DIR}/app.py"
+chown -R "${SONIX_USER}:${SONIX_USER}" "${BACKEND_DIR}"
+
+# -----------------------------
+# [9/13] Frontend
+# -----------------------------
+echo "🎨 [9/13] Creating web interface..."
+cat > "${FRONTEND_DIR}/kiosk.html" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sonix Kiosk</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { margin: 0; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+               background: linear-gradient(135deg, #1e3c72, #2a5298); color: white; text-align: center; }
+        .container { max-width: 420px; margin: 0 auto; }
+        .status { font-size: 22px; margin: 20px 0; }
+        .controls button { background: rgba(255,255,255,0.2); border: none; color: white;
+                          padding: 12px 18px; margin: 8px; border-radius: 20px;
+                          font-size: 16px; cursor: pointer; transition: all 0.3s; }
+        .controls button:hover { background: rgba(255,255,255,0.3); transform: scale(1.03); }
+        .now-playing { margin: 16px 0; padding: 16px; background: rgba(0,0,0,0.3); border-radius: 12px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎸 SONIX</h1>
+        <div class="status" id="status">🎵 Ready for NFC tags</div>
+        <div class="now-playing" id="nowPlaying" style="display:none;"></div>
+        <div class="controls">
+            <button onclick="control('pause_toggle')">⏯️ Pause/Resume</button>
+            <button onclick="control('stop')">⏹️ Stop</button>
+            <button onclick="control('skip')">⏭️ Skip</button>
+            <button onclick="window.location.href='/remote'">🎛️ Remote</button>
+        </div>
+    </div>
+    <script>
+        function control(cmd) {
+            fetch('/api/control', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cmd}) });
+        }
+        setInterval(() => {
+            fetch('/api/status').then(r => r.json()).then(data => {
+                const nowEl = document.getElementById('nowPlaying');
+                const statusEl = document.getElementById('status');
+                if (data.now) {
+                    nowEl.style.display = 'block';
+                    nowEl.innerHTML = `<strong>♪ ${data.now.title || 'Playing...'}</strong>`;
+                    statusEl.textContent = '🎵 Playing';
+                } else {
+                    nowEl.style.display = 'none';
+                    statusEl.textContent = '🎵 Ready for NFC tags';
+                }
+            }).catch(()=>{});
+        }, 1500);
+    </script>
+</body>
+</html>
+EOF
+
+cat > "${FRONTEND_DIR}/remote.html" << 'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sonix Remote</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { margin: 0; padding: 20px; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+               background: linear-gradient(135deg, #667eea, #764ba2); color: white; }
+        .container { max-width: 520px; margin: 0 auto; }
+        .section { background: rgba(255,255,255,0.1); margin: 16px 0; padding: 16px; border-radius: 12px; }
+        input, button { padding: 12px; border: none; border-radius: 8px; margin: 5px; font-size: 16px; }
+        input { background: rgba(255,255,255,0.9); color: #333; width: calc(100% - 24px); }
+        button { background: rgba(255,255,255,0.2); color: white; cursor: pointer; transition: all 0.3s; }
+        button:hover { background: rgba(255,255,255,0.3); transform: translateY(-2px); }
+        .queue-item { background: rgba(0,0,0,0.25); padding: 10px; margin: 5px 0; border-radius: 8px; }
+        .volume-slider, .progress-slider { width: 100%; }
+        .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎸 Sonix Remote</h1>
+
+        <div class="section">
+            <h3>🎵 Play URL</h3>
+            <input type="text" id="urlInput" placeholder="Paste YouTube / Spotify URL...">
+            <div class="row">
+                <button onclick="playNow()">▶️ Play Now</button>
+                <button onclick="enqueue()">➕ Add to Queue</button>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>🎛️ Controls</h3>
+            <div class="row">
+                <button onclick="control('pause_toggle')">⏯️ Pause</button>
+                <button onclick="control('stop')">⏹️ Stop</button>
+                <button onclick="control('skip')">⏭️ Skip</button>
+                <button onclick="control('repeat_toggle')" id="repeatBtn">🔁 Repeat</button>
+            </div>
+            <div style="margin-top:10px;">
+                <label>🔊 Volume</label>
+                <input type="range" class="volume-slider" min="0" max="100" value="100" id="volume" oninput="setVolume(this.value)">
+            </div>
+            <div style="margin-top:10px;">
+                <label>⏱️ Progress</label>
+                <input type="range" class="progress-slider" min="0" max="0" value="0" id="progress">
+                <div id="progressText" style="opacity:0.85; font-size:14px; margin-top:4px;"></div>
+            </div>
+        </div>
+
+        <div class="section">
+            <h3>📱 NFC Write</h3>
+            <input type="text" id="nfcUrl" placeholder="URL to write to NFC tag">
+            <button onclick="writeNFC()">✍️ Write to Tag</button>
+        </div>
+
+        <div class="section">
+            <h3>🔊 Bluetooth</h3>
+            <div class="row">
+                <button onclick="scanBT()">🔎 Scan</button>
+            </div>
+            <div id="btList" style="margin-top:8px;"></div>
+        </div>
+
+        <div class="section">
+            <h3>📋 Queue</h3>
+            <div id="queue"></div>
+            <button onclick="clearQueue()">🗑️ Clear Queue</button>
+        </div>
+    </div>
+
+    <script>
+        async function resolveUrl(raw) {
+            const r = await fetch('/api/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({url: raw})});
+            return await r.json();
+        }
+
+        async function playNow() {
+            const raw = document.getElementById('urlInput').value.trim();
+            if (!raw) return;
+            const {stream,title} = await resolveUrl(raw);
+            await fetch('/api/control', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({cmd:'play', url:raw, stream})
+            });
+            document.getElementById('urlInput').value = '';
+        }
+
+        async function enqueue() {
+            const raw = document.getElementById('urlInput').value.trim();
+            if (!raw) return;
+            const {title} = await resolveUrl(raw);
+            await fetch('/api/queue', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({url: raw, title})
+            });
+            document.getElementById('urlInput').value = '';
+        }
+
+        function control(cmd) {
+            fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cmd})});
+        }
+
+        function setVolume(vol) {
+            fetch('/api/control', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({cmd:'volume', value: Number(vol)})});
+        }
+
+        async function writeNFC() {
+            const url = document.getElementById('nfcUrl').value.trim();
+            if (!url) return;
+            const r = await fetch('/api/nfc/write', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
+            const d = await r.json();
+            alert(d.ok ? '✅ NFC write successful!' : ('❌ NFC write failed: ' + (d.error||'')));
+        }
+
+        async function scanBT() {
+            const r = await fetch('/api/bt/scan'); const d = await r.json();
+            const list = d.devices || [];
+            const el = document.getElementById('btList');
+            el.innerHTML = list.map(dev => `<div class="queue-item">${dev.name || 'Unknown'} <code>${dev.mac}</code>
+                <button onclick="pairBT('${dev.mac}')">Pair</button></div>`).join('') || '<div class="queue-item">No devices</div>';
+        }
+
+        async function pairBT(mac) {
+            await fetch('/api/bt/pair', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({mac})});
+            alert('Requested pair/connect to ' + mac + '. If audio not routed, set Audio target to BT in settings.');
+        }
+
+        async function clearQueue() {
+            await fetch('/api/queue', {method:'DELETE'});
+        }
+
+        function fmt(s) {
+            s = Number(s||0);
+            const m = Math.floor(s/60), ss = Math.floor(s%60);
+            return `${m}:${ss<10?'0':''}${ss}`;
+        }
+
+        const prog = document.getElementById('progress');
+        const progText = document.getElementById('progressText');
+        prog.addEventListener('change', async (e) => {
+            const seconds = Number(e.target.value || 0);
+            await fetch('/api/seek', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({seconds})});
+        });
+
+        setInterval(async () => {
+            try{
+                const r = await fetch('/api/status'); const s = await r.json();
+                const qEl = document.getElementById('queue');
+                fetch('/api/queue').then(r=>r.json()).then(data => {
+                    qEl.innerHTML = (data.queue||[]).map(item => `<div class="queue-item">♪ ${item.title || item.url}</div>`).join('') || '<div class="queue-item">Queue is empty</div>';
+                });
+                if (s.duration) { prog.max = s.duration; }
+                prog.value = s.position || 0;
+                progText.textContent = `${fmt(s.position)} / ${fmt(s.duration)}`;
+            }catch(e){}
+        }, 1000);
+    </script>
+</body>
+</html>
+EOF
+
+# -----------------------------
+# [10/13] NFC Tools
+# -----------------------------
+echo "📡 [10/13] Creating NFC tools..."
+
+# NFC Write with TLV-wrapped NDEF
+cat > "${TOOLS_DIR}/nfc_write.py" << 'EOF'
+#!/opt/sonix/venv/bin/python3
+import sys, time, subprocess
+
+def log(msg):
+    print(msg, flush=True)
+
+def create_ndef_uri_record(uri: str) -> bytes:
+    uri_identifier = 0x00  # No abbreviation
+    payload = bytes([uri_identifier]) + uri.encode('utf-8')
+    header = bytes([0xD1, 0x01, len(payload), 0x55])  # MB/ME, type len=1, payload len, 'U'
+    return header + payload
+
+def build_tlv_ndef(ndef_record: bytes) -> bytes:
+    nlen = len(ndef_record)
+    if nlen < 0xFF:
+        tlv = bytes([0x03, nlen]) + ndef_record + b"\xFE"
+    else:
+        tlv = bytes([0x03, 0xFF, (nlen >> 8) & 0xFF, nlen & 0xFF]) + ndef_record + b"\xFE"
+    pad = (4 - (len(tlv) % 4)) % 4
+    return tlv + (b"\x00" * pad)
+
+def write_nfc_tag(url: str) -> bool:
+    try:
+        import board, busio
+        from adafruit_pn532.i2c import PN532_I2C
+    except ImportError as e:
+        log(f"❌ Import error: {e}")
+        return False
+
+    try:
+        res = subprocess.run(['i2cdetect', '-y', '1'], capture_output=True, text=True, timeout=10)
+        if '24' not in res.stdout and '48' not in res.stdout:
+            log("❌ PN532 not detected on I2C bus")
+            return False
+        log("✅ PN532 detected on I2C bus")
+    except Exception as e:
+        log(f"❌ i2cdetect failed: {e}")
+        return False
+
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=100000)
+        time.sleep(0.8)
+        pn = PN532_I2C(i2c, debug=False)
+        time.sleep(0.5)
+        try:
+            pn.SAM_configuration()
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"❌ PN532 init failed: {e}")
+        return False
+
+    log("🏷️ Tap tag to write (10s)...")
+    uid = None
+    for _ in range(100):
+        uid = pn.read_passive_target(timeout=0.1)
+        if uid:
+            break
+        time.sleep(0.1)
+    if not uid:
+        log("❌ No tag detected")
+        return False
+
+    log(f"✅ Tag UID: {' '.join(hex(x) for x in uid)}")
+    ndef = create_ndef_uri_record(url)
+    tlv = build_tlv_ndef(ndef)
+
+    block = 4
+    for i in range(0, len(tlv), 4):
+        chunk = tlv[i:i+4]
+        try:
+            pn.ntag2xx_write_block(block, chunk)
+        except Exception as e:
+            log(f"❌ write block {block} failed: {e}")
+            return False
+        time.sleep(0.12)
+        block += 1
+
+    log("🎉 NFC tag written successfully")
+    return True
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: nfc_write.py <URL>")
+        sys.exit(2)
+    url = sys.argv[1].strip()
+    ok = write_nfc_tag(url)
+    sys.exit(0 if ok else 1)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# NFC Read (extract URL)
+cat > "${TOOLS_DIR}/nfc_read.py" << 'EOF'
+#!/opt/sonix/venv/bin/python3
+import time, re
+try:
+    import board, busio
+    from adafruit_pn532.i2c import PN532_I2C
+except Exception as e:
+    print("Adafruit PN532 import failed:", e)
+    raise
+
+def extract_url_from_data(data: bytes):
+    if not data or len(data) < 4:
+        return None
+    try:
+        for i in range(len(data) - 4):
+            if data[i] == 0xD1 and data[i+1] == 0x01 and data[i+3] == 0x55:
+                payload_len = data[i+2]
+                start = i + 4
+                if start + payload_len <= len(data) and payload_len > 0:
+                    uri_data = data[start+1:start+payload_len]
+                    uri_str = uri_data.decode('utf-8', errors='ignore').rstrip('\x00\x03\xfe')
+                    if uri_str.startswith("http"):
+                        return uri_str
+    except Exception:
+        pass
+    try:
+        s = data.decode('utf-8', errors='ignore')
+        m = re.search(r'(https?://[^\s\x00\x03\xfe]+)', s)
+        if m:
+            return m.group(1).rstrip('\x00\x03\xfe')
+    except Exception:
+        pass
+    return None
+
+def main():
+    i2c = busio.I2C(board.SCL, board.SDA, frequency=100000)
+    pn = PN532_I2C(i2c, debug=False)
+    try:
+        pn.SAM_configuration()
+    except Exception:
+        pass
+    print("Tap a tag to read (5s)...")
+    uid = pn.read_passive_target(timeout=5)
+    if not uid:
+        print("No tag")
+        return
+    print("UID:", [hex(x) for x in uid])
+    buf = bytearray()
+    for page in range(4, 40):
+        try:
+            blk = pn.ntag2xx_read_block(page)
+            if not blk:
+                break
+            buf.extend(bytes(blk[:4]))
+        except Exception:
+            break
+    url = extract_url_from_data(bytes(buf))
+    if url:
+        print(f"Found URL: {url}")
+    else:
+        print("No URL found")
+
+if __name__ == "__main__":
+    main()
+EOF
+
+# NFC Autoplay service worker
+cat > "${TOOLS_DIR}/nfc_autoplay.py" << 'EOF'
+#!/opt/sonix/venv/bin/python3
+import time, requests, sys, re
+print("🚀 Sonix NFC Autoplay Starting...")
+
+try:
+    import board, busio
+    from adafruit_pn532.i2c import PN532_I2C
+except Exception as e:
+    print(f"💥 Import error: {e}")
+    sys.exit(2)
+
+def init_pn532():
+    try:
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=100000)
+        time.sleep(0.8)
+        pn = PN532_I2C(i2c, debug=False)
+        time.sleep(0.5)
+        try:
+            pn.SAM_configuration()
+        except Exception:
+            pass
+        return pn
+    except Exception as e:
+        print(f"❌ PN532 initialization failed: {e}")
+        return None
+
+def extract_url_from_data(data: bytes):
+    if not data or len(data) < 4:
+        return None
+    try:
+        for i in range(len(data) - 4):
+            if data[i] == 0xD1 and data[i+1] == 0x01 and data[i+3] == 0x55:
+                payload_len = data[i+2]
+                start = i + 4
+                if start + payload_len <= len(data) and payload_len > 0:
+                    uri_data = data[start+1:start+payload_len]
+                    uri_str = uri_data.decode('utf-8', errors='ignore').rstrip('\x00\x03\xfe')
+                    if uri_str.startswith("http"):
+                        return uri_str
+    except Exception:
+        pass
+    try:
+        s = data.decode('utf-8', errors='ignore')
+        m = re.search(r'(https?://[^\s\x00\x03\xfe]+)', s)
+        if m:
+            return m.group(1).rstrip('\x00\x03\xfe')
+    except Exception:
+        pass
+    return None
+
+def play_url(url: str):
+    try:
+        print(f"🎵 Playing: {url}")
+        r = requests.post("http://localhost:5000/api/control", json={"cmd":"play","url":url}, timeout=10)
+        print("🎉 Song playing!" if r.status_code == 200 else f"❌ Play failed: {r.status_code}")
+        return r.status_code == 200
+    except Exception as e:
+        print(f"❌ Play request failed: {e}")
+        return False
+
+pn = init_pn532()
+if not pn:
+    sys.exit(3)
+
+print("🎵 NFC Autoplay ready! Tap a tag...")
+
+last_uid = None
+while True:
+    try:
+        uid = pn.read_passive_target(timeout=1)
+        if uid:
+            uid_s = ":".join(f"{b:02X}" for b in uid)
+            if uid_s == last_uid:
+                time.sleep(0.4)
+                continue
+            last_uid = uid_s
+            buf = bytearray()
+            for page in range(4, 40):
+                try:
+                    blk = pn.ntag2xx_read_block(page)
+                    if not blk:
+                        break
+                    buf.extend(bytes(blk[:4]))
+                except Exception:
+                    break
+            url = extract_url_from_data(bytes(buf))
+            if url:
+                play_url(url)
+            else:
+                print("⚠️ No URL found on tag")
+        else:
+            last_uid = None
+        time.sleep(0.4)
+    except KeyboardInterrupt:
+        print("\n👋 Stopping NFC autoplay...")
+        break
+    except Exception as e:
+        print(f"⚠️ Error: {e}")
+        time.sleep(2)
+
+print("🔚 NFC Autoplay stopped")
+EOF
+
+# Helper scripts
+cat > "${TOOLS_DIR}/nfc_write_helper.sh" << 'EOF'
+#!/usr/bin/env bash
+set -e
+URL="$1"
+if [[ -z "$URL" ]]; then echo "Usage: nfc_write_helper.sh <URL>"; exit 2; fi
+/opt/sonix/venv/bin/python /opt/sonix/tools/nfc_write.py "$URL"
+EOF
+
+cat > "${TOOLS_DIR}/nfc_read_helper.sh" << 'EOF'
+#!/usr/bin/env bash
+set -e
+/opt/sonix/venv/bin/python /opt/sonix/tools/nfc_read.py
+EOF
+
+chmod +x "${TOOLS_DIR}"/*.py "${TOOLS_DIR}"/*.sh
+chown -R "${SONIX_USER}:${SONIX_USER}" "${TOOLS_DIR}"
+
+# -----------------------------
+# [11/13] VLC play helper
+# -----------------------------
+echo "🎵 [11/13] Creating VLC playback helper..."
+cat > /usr/local/bin/sonix-play << 'EOF'
+#!/usr/bin/env bash
+set -e
+export PULSE_SERVER=unix:/var/run/pulse/native
+
+VENV_YTDLP="/opt/sonix/venv/bin/yt-dlp"
+URL="$1"
+RC_SOCK="/run/sonix_vlc.sock"
+LOG_FILE="/var/log/sonix/player_cvlc.log"
+
+if [[ "$1" == "--stop" ]]; then
+  if [[ -f /run/sonix_player.pid ]]; then
+    kill "$(cat /run/sonix_player.pid)" 2>/dev/null || true
+    rm -f /run/sonix_player.pid
+  fi
+  rm -f "$RC_SOCK" 2>/dev/null || true
+  exit 0
+fi
+
+if [[ -z "$URL" ]]; then
+  echo "usage: sonix-play <URL>"
+  exit 2
+fi
+
+STREAM="$URL"
+if [[ "$URL" =~ ^https?:// && ! "$URL" =~ (googlevideo|manifest\.googlevideo|\.m3u8|\.m4a|\.opus|\.mp3) ]]; then
+  if [[ -x "$VENV_YTDLP" ]]; then
+    STREAM=$("$VENV_YTDLP" -g -f "bestaudio[abr<=160]/bestaudio/best" --no-playlist "$URL" 2>/dev/null | head -n1 || true)
+    [[ -z "$STREAM" ]] && STREAM="$URL"
+  fi
+fi
+
+if [[ -f /run/sonix_player.pid ]]; then
+  kill "$(cat /run/sonix_player.pid)" 2>/dev/null || true
+  rm -f /run/sonix_player.pid
+fi
+rm -f "$RC_SOCK" 2>/dev/null || true
+
+cvlc --no-video --intf dummy --extraintf rc --rc-unix "$RC_SOCK" \
+     --play-and-exit --network-caching=300 "$STREAM" >> "$LOG_FILE" 2>&1 &
+echo $! > /run/sonix_player.pid
+EOF
+chmod +x /usr/local/bin/sonix-play
+
+# -----------------------------
+# [12/13] systemd services
+# -----------------------------
+echo "⚙️ [12/13] Creating services..."
+cat > /etc/systemd/system/sonix-backend.service << 'EOF'
+[Unit]
+Description=Sonix Backend (Flask)
+After=network.target pulseaudio-system.service
+
+[Service]
+Type=simple
+User=sonix
+Group=sonix
+WorkingDirectory=/opt/sonix/backend
+Environment=PULSE_SERVER=unix:/var/run/pulse/native
+ExecStart=/opt/sonix/venv/bin/python app.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/sonix-nfc.service << 'EOF'
+[Unit]
+Description=Sonix NFC Autoplay
+After=network.target sonix-backend.service
+
+[Service]
+Type=simple
+User=sonix
+Group=sonix
+WorkingDirectory=/opt/sonix
+ExecStart=/opt/sonix/venv/bin/python /opt/sonix/tools/nfc_autoplay.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /etc/systemd/system/sonix-apply-audio.service << 'EOF'
+[Unit]
+Description=Apply Sonix audio target at boot
+After=pulseaudio-system.service sound.target network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sonix-apply-audio-target
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable sonix-backend.service sonix-nfc.service sonix-apply-audio.service
+
+# -----------------------------
+# [13/13] Diagnostics + README
+# -----------------------------
+echo "🔧 [13/13] Creating diagnostics and README..."
+cat > "${TOOLS_DIR}/sonix_diagnostic.py" << 'EOF'
+#!/opt/sonix/venv/bin/python3
+import subprocess, time, requests, sys
+
+def log(msg):
+    print(msg, flush=True)
+
+def main():
+    log("🔧 === SONIX DIAGNOSTIC TOOL ===")
+    try:
+        res = subprocess.run(['i2cdetect', '-y', '1'], capture_output=True, text=True, timeout=10)
+        if '24' in res.stdout or '48' in res.stdout:
+            log("✅ PN532 detected on I2C bus")
+        else:
+            log("❌ PN532 NOT detected on I2C bus")
+    except Exception as e:
+        log(f"❌ I2C test failed: {e}")
+
+    try:
+        import board, busio
+        from adafruit_pn532.i2c import PN532_I2C
+        log("✅ Adafruit PN532 libs OK")
+    except Exception as e:
+        log(f"❌ Adafruit libs error: {e}")
+
+    try:
+        r = requests.get("http://localhost:5000/api/status", timeout=5)
+        log("✅ Backend responding" if r.status_code == 200 else f"❌ Backend code {r.status_code}")
+    except Exception as e:
+        log(f"❌ Backend connection failed: {e}")
+
+    for svc in ["pulseaudio-system","sonix-backend","sonix-nfc"]:
+        try:
+            st = subprocess.run(['systemctl','is-active', f'{svc}.service'], capture_output=True, text=True)
+            if 'active' in st.stdout:
+                log(f"✅ {svc} active")
+            else:
+                log(f"❌ {svc} inactive")
+        except Exception as e:
+            log(f"❌ {svc} check failed: {e}")
+
+    log("🏁 Diagnostic complete")
+
+if __name__ == "__main__":
+    main()
+EOF
+chmod +x "${TOOLS_DIR}/sonix_diagnostic.py"
+chown -R "${SONIX_USER}:${SONIX_USER}" "${TOOLS_DIR}"
+
+cat > "${APP_ROOT}/README.md" << 'EOF'
+# 🎸 SONIX - NFC Jukebox
+
+## Quick Start
+- Web Remote: http://YOUR_PI_IP:5000/remote (or http://sonix.local:5000/remote)
+- Kiosk: http://YOUR_PI_IP:5000/
+
+## NFC
+- Write tag: `sudo /opt/sonix/tools/nfc_write.py 'https://youtu.be/VIDEO_ID'`
+- Read tag: `sudo /opt/sonix/tools/nfc_read.py`
+
+## Services
+- Status: `sudo systemctl status sonix-backend sonix-nfc pulseaudio-system`
+- Restart: `sudo systemctl restart sonix-backend sonix-nfc pulseaudio-system`
+- Logs:
+  - Backend: `journalctl -u sonix-backend -f`
+  - NFC: `journalctl -u sonix-nfc -f`
+  - PulseAudio: `journalctl -u pulseaudio-system -f`
+  - VLC: `/var/log/sonix/player_cvlc.log`
+
+## Diagnostics
+- Full test: `sudo /opt/sonix/tools/sonix_diagnostic.py`
+
+## Troubleshooting
+1. Enable I2C in `raspi-config` if not detected by `i2cdetect -y 1`
+2. If Bluetooth connects but no sound, set audio target to BT: `sudo /usr/local/bin/sonix-apply-audio-target`
+3. If volume slider unresponsive, ensure PulseAudio system service is active
+EOF
+
+chown "${SONIX_USER}:${SONIX_USER}" "${APP_ROOT}/README.md"
+
+# -----------------------------
+# Finalize
+# -----------------------------
+echo "🔧 Finalizing installation..."
+chown -R "${SONIX_USER}:${SONIX_USER}" "${APP_ROOT}"
+chmod -R 755 "${APP_ROOT}"
+
+systemctl start sonix-backend.service sonix-apply-audio.service || true
+
+echo ""
+echo "🎸 === SONIX INSTALLATION COMPLETE === 🎸"
+echo ""
+IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+echo "✅ I2C enabled (reboot if first-time). NFC + Backend installed."
+echo "🌐 Web Remote: http://${IP}:5000/remote  or  http://sonix.local:5000/remote"
+echo "📟 Kiosk: http://${IP}:5000/"
+echo ""
+echo "📋 Next Steps:"
+echo "  1) REBOOT if you just enabled I2C: sudo reboot"
+echo "  2) Test I2C: i2cdetect -y 1 (look for 0x24 or 0x48)"
+echo "  3) Diagnostics: sudo /opt/sonix/tools/sonix_diagnostic.py"
+echo "  4) Write first tag: sudo /opt/sonix/tools/nfc_write.py 'https://youtu.be/dQw4w9WgXcQ'"
+echo ""
+echo "🎵 Enjoy your NFC Jukebox!"
